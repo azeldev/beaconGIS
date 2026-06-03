@@ -4,7 +4,7 @@ AI-powered building-level damage classification from pre-/post-disaster RGB sate
 
 The plugin uses a Siamese U-Net ensemble (SeResNeXt-50 32x4d encoder) trained on the full public xView2 / xBD dataset and runs entirely on ONNX Runtime — **no PyTorch install required**. Designed as a draft-generation tool for disaster-response analysts: output should be reviewed by humans, not used as authoritative ground truth.
 
-> 📊 **Combined F1 = 0.7312** (xView2 official scorer, full plugin pipeline)
+> 📊 **Combined F1 = 0.7358** (xView2 official scorer, full plugin pipeline)
 > 📦 **Plugin install footprint**: ~150 MB of Python deps + ~234 MB of AI weights (downloaded on first run, fp16)
 
 ## Features
@@ -29,7 +29,7 @@ python -m pip install onnxruntime numpy pillow scipy opencv-python
 **GPU acceleration (optional, recommended)** — pick ONE:
 
 ```bash
-# Windows with any DirectX 12 GPU (Intel/AMD/NVIDIA — no CUDA Toolkit needed):
+# Windows with any DirectX 12 GPU (Intel/AMD/NVIDIA — no CUDA Toolkit needed. RECOMMENDED):
 python -m pip install onnxruntime-directml
 
 # NVIDIA CUDA (requires matching CUDA runtime):
@@ -58,7 +58,7 @@ On the OSGeo4W shell (Windows) replace `python` with `python-qgis` to install in
 
 ## First-run setup
 
-The plugin downloads ~234 MB of fp16 model weights from the project's [GitHub releases page](https://github.com/azeldev03/beaconGIS/releases) on first run. No account, no token, no form — plain HTTPS download, SHA-256 verified end-to-end. Subsequent runs use the local cache.
+The plugin downloads ~234 MB of  model weights from the project's [GitHub releases page](https://github.com/azeldev03/beaconGIS/releases) on first run. No account, no token, no form — plain HTTPS download, SHA-256 verified end-to-end. Subsequent runs use the local cache.
 
 Manual install: download the three `.onnx` files from the [latest release](https://github.com/azeldev03/beaconGIS/releases/latest) and drop them into the plugin folder (e.g. `~/AppData/Roaming/QGIS/QGIS3/profiles/default/python/plugins/change_detector/`).
 
@@ -86,7 +86,7 @@ When detection completes, the **Assessment Reports panel** opens on the right wi
 | Classification | SiameseUNet, SeResNeXt-50 (32x4d) encoder, 4-class output |
 | Ensemble | cls_best.onnx + cls_m2.onnx (independent seeds, fused via softmax-mean) |
 | Training data | ImageNet → Inria Aerial → xBD (Tier 1 + Tier 3 + earthquake-augmented sampling) |
-| Combined F1 (xView2 scorer) | **0.7312** |
+| Combined F1 (xView2 scorer) | **0.7358** |
 | Per-class F1 (cls_best) | NoDmg 0.918, Minor 0.437, Major 0.750, Destroyed 0.825 |
 | Per-class F1 (cls_m2) | NoDmg 0.925, Minor 0.497, Major 0.656, Destroyed 0.828 |
 | Distribution format | ONNX (opset 17, dynamic axes on batch/H/W) |
@@ -96,8 +96,7 @@ When detection completes, the **Assessment Reports panel** opens on the right wi
 
 - **xBD-style imagery** (Maxar pre + Maxar post, well-aligned, near-nadir): works well — this is what the model was trained on.
 - **Same-sensor cross-event imagery** (e.g. Maxar Open Data captures of recent disasters): works as a draft. Expect ~70 % useful polygons that an analyst can refine in 15 minutes.
-- **Cross-sensor or off-nadir pairs** (e.g. archive Maxar pre + post-event Pléiades, or drone surveys): partially handled by GSD normalization, but residual artifacts remain. Off-nadir scenes systematically over-predict damage from rooftop parallax — review against the source imagery before publishing.
-- **Minor damage class is the hardest** (F1 ≈ 0.44–0.50). Filter the damage layer by `damage_class = 2` and the `confidence` attribute to triage uncertain buildings before publishing.
+- **Cross-sensor or off-nadir pairs** : partially handled by GSD normalization, but residual artifacts remain. Off-nadir scenes systematically over-predict damage from rooftop parallax — review against the source imagery before publishing.
 - **The plugin is a draft generator, not an authoritative result.** Always review output before using it for response, allocation, or policy decisions.
 
 ## Privacy
@@ -137,10 +136,8 @@ If you use this plugin in research or response work, please cite both:
 
 - **xView2 / xBD** dataset (Gupta et al. 2019)
 - **Inria Aerial Image Labeling** dataset
-- **vdurnov's xView2 first-place solution** (2019) — architectural inspiration
 - **timm** (Ross Wightman) — the SeResNeXt-50 encoder
 - **ONNX Runtime** (Microsoft) — the inference backend that lets this plugin ship without a 1.5 GB PyTorch install
-- **The Deepness QGIS plugin** (Aszkowski et al. 2023, *SoftwareX*) — packaging conventions
 
 ## Contact
 
