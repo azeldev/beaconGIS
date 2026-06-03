@@ -402,9 +402,9 @@ class BuildingDamageEngine:
     #     python -c "import hashlib;print(hashlib.sha256(open('loc_best_fp16.onnx','rb').read()).hexdigest())"
     _RELEASE_TAG = "v1.0.0"
     _RELEASE_BASE = (
-        f"https://github.com/azeldev03/beaconGIS/releases/download/{_RELEASE_TAG}"
+        f"https://github.com/azeldev/beaconGIS/releases/download/{_RELEASE_TAG}"
     )
-    WEIGHTS_HOMEPAGE = "https://github.com/azeldev03/beaconGIS/releases"
+    WEIGHTS_HOMEPAGE = "https://github.com/azeldev/beaconGIS/releases"
 
     # Filenames of the on-disk model artifacts. The plugin ships fp16
     # weights for ~2× DirectML speedup + half the download size. The
