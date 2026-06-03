@@ -10,7 +10,7 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsFeature, QgsField, QgsFiel
 from qgis.PyQt.QtCore import QVariant
 from .change_detector_dialog import ChangeDetectorDialog
 from .building_damage_engine import BuildingDamageEngine
-from .llm_assistant import LLMAssistantDock
+from .assistant import AssessmentReportsDock
 from .satellite_downloader import SatelliteDownloaderDock
 
 
@@ -84,7 +84,7 @@ class ChangeDetector:
 
     def show_assistant(self):
         if self.assistant_dock is None:
-            self.assistant_dock = LLMAssistantDock(self.iface, self.iface.mainWindow())
+            self.assistant_dock = AssessmentReportsDock(self.iface, self.iface.mainWindow())
             self.iface.addDockWidget(Qt.RightDockWidgetArea, self.assistant_dock)
         else:
             if self.assistant_dock.isVisible():
