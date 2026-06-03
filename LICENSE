@@ -1,0 +1,120 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 2, June 1991
+
+  Copyright (C) 1989, 1991 Free Software Foundation, Inc.,
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  Everyone is permitted to copy and distribute verbatim copies
+  of this license document, but changing it is not allowed.
+
+  beaconGIS — Building Damage Assessment QGIS Plugin
+  Copyright (C) 2026 Adem Özel
+
+  This program is free software; you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation; either version 2 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License along
+  with this program; if not, write to the Free Software Foundation, Inc.,
+  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+  Full license text: https://www.gnu.org/licenses/gpl-2.0.html
+
+
+================================================================================
+NOTICE — separate license for the AI model weights
+================================================================================
+
+The PLUGIN CODE in this repository is licensed GPL v2+ (above), matching
+the QGIS host application's license.
+
+The AI MODEL WEIGHTS that the plugin downloads on first run are a SEPARATE
+work, distributed under a DIFFERENT license:
+
+    Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+    (CC BY-NC-SA 4.0)
+    https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+The weights are distributed via the plugin's GitHub release page:
+
+    https://github.com/azeldev03/beaconGIS/releases
+
+Why two licenses?
+
+The plugin code is software, and the QGIS Plugin Repository expects
+GPL-compatible licensing. The weights are training-derived artifacts that
+inherit a CC BY-NC-SA 4.0 share-alike obligation from the upstream xView2
+/ xBD dataset (Gupta et al. 2019), which itself is licensed CC BY-NC-SA
+4.0. We carry that obligation forward as required by the dataset terms.
+
+In practice this means:
+
+  * The plugin CODE may be forked, modified, and re-shipped under GPL.
+  * The model WEIGHTS may be used for academic, research, humanitarian,
+    and educational purposes only — never for commercial products or
+    paid services without separate written permission from the author.
+  * Any model fine-tuned or distilled from these weights must itself be
+    released under CC BY-NC-SA 4.0 or a one-way-compatible license.
+
+================================================================================
+THIRD-PARTY ATTRIBUTIONS
+================================================================================
+
+This plugin and the upstream model weights are derivatives of, or depend
+on at runtime, the following works. Their licenses must be preserved when
+this plugin is redistributed.
+
+1. xView2 / xBD Dataset
+   Gupta R., Goodman B., Patel N. et al. (2019)
+   arXiv:1911.09296
+   License: CC BY-NC-SA 4.0
+   https://xview2.org/
+
+2. timm (PyTorch Image Models)
+   Wightman R., maintainers et al.
+   License: Apache 2.0
+   The SeResNeXt-50 (32x4d) encoder architecture used during training and
+   referenced in model.py.
+   https://github.com/huggingface/pytorch-image-models
+
+3. ONNX Runtime
+   Microsoft and the ONNX Runtime contributors
+   License: MIT
+   Used at plugin runtime for inference.
+   https://github.com/microsoft/onnxruntime
+
+4. PyTorch
+   Meta AI / PyTorch Foundation
+   License: BSD 3-Clause
+   Used during training and during one-off ONNX export. NOT a plugin
+   runtime dependency.
+   https://pytorch.org
+
+5. QGIS
+   QGIS Development Team
+   License: GPL v2+
+   Host application for the plugin.
+   https://qgis.org/
+
+6. Inria Aerial Image Labeling Dataset
+   Maggiori E. et al. (2017)
+   License: research use; see source.
+   Used for mid-training of the localization U-Net.
+   https://project.inria.fr/aerialimagelabeling/
+
+================================================================================
+CITATION
+================================================================================
+
+If you use this plugin or its weights in research, please cite both:
+
+    Özel, A. (2026). beaconGIS: AI Building Damage Detection for QGIS.
+        QGIS plugin. https://github.com/azeldev03/beaconGIS
+
+    Gupta R. et al. (2019). xBD: A Dataset for Assessing Building Damage
+        from Satellite Imagery. arXiv:1911.09296.
