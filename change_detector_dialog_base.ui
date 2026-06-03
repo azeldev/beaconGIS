@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ChangeDetectorDialogBase</class>
+ <widget class="QDialog" name="ChangeDetectorDialogBase">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>560</width>
+    <height>620</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Building Damage Assessment</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QLabel" name="header_label">
+     <property name="text">
+      <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;&lt;span style=" font-weight:600;"&gt;AI Building Damage Detection&lt;/span&gt;&lt;br/&gt;&lt;span style=" font-style:italic;"&gt;Load pre- and post-disaster high-resolution RGB imagery. The model classifies each building into: No Damage, Minor, Major, or Destroyed.&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+
+   <item>
+    <widget class="QGroupBox" name="building_damage_inputs">
+     <property name="title">
+      <string>Input Imagery</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_4">
+      <item>
+       <widget class="QGroupBox" name="groupBox_damage_before">
+        <property name="title">
+         <string>Before Disaster Image</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_3">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_damage_before">
+           <property name="text">
+            <string>RGB Image:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QgsMapLayerComboBox" name="damage_before_combo"/>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="damage_before_button">
+           <property name="text">
+            <string>Load...</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="groupBox_damage_after">
+        <property name="title">
+         <string>After Disaster Image</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_4">
+         <item row="0" column="0">
+          <widget class="QLabel" name="label_damage_after">
+           <property name="text">
+            <string>RGB Image:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QgsMapLayerComboBox" name="damage_after_combo"/>
+         </item>
+         <item row="0" column="2">
+          <widget class="QPushButton" name="damage_after_button">
+           <property name="text">
+            <string>Load...</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+
+   <item>
+    <widget class="QGroupBox" name="aoi_group">
+     <property name="title">
+      <string>Region of Interest (optional)</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_aoi">
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_aoi">
+        <property name="text">
+         <string>AOI Polygon Layer:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QgsMapLayerComboBox" name="aoi_combo"/>
+      </item>
+      <item row="1" column="0" colspan="2">
+       <widget class="QLabel" name="label_aoi_hint">
+        <property name="text">
+         <string>&lt;i&gt;Leave empty to analyze the entire image. Provide a polygon layer to clip results to a specific area (saves time on large scenes).&lt;/i&gt;</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+
+   <item>
+    <widget class="QGroupBox" name="inference_options">
+     <property name="title">
+      <string>Inference Options</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_options">
+      <item row="0" column="0" colspan="3">
+       <widget class="QCheckBox" name="tta_checkbox">
+        <property name="text">
+         <string>Use Test-Time Augmentation (4-way) — slower but more accurate results</string>
+        </property>
+        <property name="toolTip">
+         <string>When enabled, runs 4-way TTA per tile: identity + horizontal flip + vertical flip + 180-degree rotation, then averages the 4 softmax outputs. ~4x inference cost. Ablation on xBD validation showed 4-way captures essentially the full TTA gain; larger schemes (8-way D4, multi-scale) provided no additional benefit at higher cost.
+
+Default OFF (single forward pass per tile) so first-time users get a fast result. Tick for a small accuracy bump on final production runs.</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" colspan="3">
+       <widget class="QCheckBox" name="cpu_fast_mode_checkbox">
+        <property name="text">
+         <string>CPU Fast Mode — for machines without a GPU (~8× faster, slight accuracy hit)</string>
+        </property>
+        <property name="toolTip">
+         <string>When enabled AND the engine detects no GPU is available, the plugin runs a stripped-down inference path: TTA is disabled (4× fewer forward passes) and only the primary cls model is loaded even when ensemble members are present in the plugin folder (2× fewer forward passes). Combined ~8× speedup on CPU at a measured accuracy cost of ~0.005 mean F1.
+
+When a GPU is available, this checkbox has no effect — the full TTA + ensemble pipeline runs because GPU latency makes the accuracy gain free.
+
+Recommended ON for laptops without a GPU and field deployments where battery life matters. Recommended OFF for desktop installations with any CUDA / DirectML capable card.</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_segmentation">
+        <property name="text">
+         <string>Building separation:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QSlider" name="segmentation_slider">
+        <property name="toolTip">
+         <string>How aggressively touching buildings are split into separate footprints (higher = more separation). Move RIGHT if distinct buildings merge into one blob (under-segmentation); move LEFT if single buildings get split into pieces (over-segmentation). Affects output grouping only, not the damage classes.</string>
+        </property>
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="minimum">
+         <number>0</number>
+        </property>
+        <property name="maximum">
+         <number>100</number>
+        </property>
+        <property name="singleStep">
+         <number>1</number>
+        </property>
+        <property name="pageStep">
+         <number>10</number>
+        </property>
+        <property name="value">
+         <number>50</number>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="2">
+       <widget class="QLabel" name="seg_value_label">
+        <property name="text">
+         <string>50%</string>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>45</width>
+          <height>0</height>
+         </size>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+
+   <item>
+    <widget class="QGroupBox" name="output_options">
+     <property name="title">
+      <string>Output Options</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_outputs">
+      <item>
+       <widget class="QCheckBox" name="save_gpkg_checkbox">
+        <property name="text">
+         <string>Save vector output as GeoPackage (.gpkg)</string>
+        </property>
+        <property name="toolTip">
+         <string>Write the damage-classified building polygons to a .gpkg file next to the post-disaster image. Useful for sharing results outside QGIS, archiving, or loading into other GIS tools.
+
+Output: &lt;post_image_name&gt;_damage.gpkg
+  Table: damage_buildings</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="save_mask_checkbox">
+        <property name="text">
+         <string>Save damage mask as GeoTIFF (for training your own model)</string>
+        </property>
+        <property name="toolTip">
+         <string>Write the per-pixel damage class as a single-band GeoTIFF aligned with the input image. Pixel values: 0=background, 1=No Damage, 2=Minor, 3=Major, 4=Destroyed.
+
+Pair the mask with your pre/post image triplet (matched by filename stem) to build a training set for fine-tuning a model on disaster types xBD doesn't cover (e.g. earthquakes). Same label format xBD uses, so any xBD-compatible training script reads these directly.
+
+Output: &lt;post_image_name&gt;_mask.tif (palette-colored when viewed; raw 0..4 values when loaded for training)
+A companion &lt;post_image_name&gt;_meta.json records which models, threshold, and post-processing produced the mask.</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>40</height>
+      </size>
+     </property>
+    </spacer>
+   </item>
+
+   <item>
+    <widget class="QDialogButtonBox" name="button_box">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <property name="standardButtons">
+      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>QgsMapLayerComboBox</class>
+   <extends>QComboBox</extends>
+   <header>qgis.gui</header>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>button_box</sender>
+   <signal>accepted()</signal>
+   <receiver>ChangeDetectorDialogBase</receiver>
+   <slot>accept()</slot>
+  </connection>
+  <connection>
+   <sender>button_box</sender>
+   <signal>rejected()</signal>
+   <receiver>ChangeDetectorDialogBase</receiver>
+   <slot>reject()</slot>
+  </connection>
+ </connections>
+</ui>
