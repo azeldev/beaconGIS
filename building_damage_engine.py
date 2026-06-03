@@ -572,7 +572,11 @@ class BuildingDamageEngine:
         # Order matters: MODEL_FILES first so the published benchmark
         # configuration is the default ensemble.
         cls_paths = [(self.CLS_PRIMARY_FILENAME, cls_path)]
-        fast_skip = self.cpu_fast_mode and self.device.type == 'cpu'
+        # Fast Mode skips ensemble + TTA regardless of active device. Even
+        # on a GPU, single-model can be ~2× faster than 2-model ensemble
+        # when the user prefers latency over the ~0.5pt F1 boost the
+        # ensemble provides.
+        fast_skip = self.cpu_fast_mode
         if not fast_skip:
             for fname in self.MODEL_FILES:
                 if fname.startswith('cls_') and fname != self.CLS_PRIMARY_FILENAME:
@@ -648,7 +652,7 @@ class BuildingDamageEngine:
         self.log(f"Loaded: {os.path.basename(loc_path)} + {cls_desc} "
                  f"on {self.device} ({precision})")
         if fast_skip:
-            self.log("  CPU Fast Mode active — TTA and ensemble members skipped")
+            self.log("  Fast Mode active — TTA and ensemble members skipped")
 
         # If a GPU provider was in our preference list but didn't actually
         # bind to the session, surface that loudly — common cause is the
@@ -694,11 +698,10 @@ class BuildingDamageEngine:
                      Qgis.Warning)
             tta_mode = 'off'
 
-        # CPU Fast Mode forces TTA off on CPU runs.
-        if (self.cpu_fast_mode and self.device.type == 'cpu'
-                and tta_mode != 'off'):
-            self.log(f"   CPU Fast Mode: forcing tta_mode='off' "
-                     f"(was '{tta_mode}')")
+        # Fast Mode forces TTA off (no augmented passes), in addition to
+        # the single-model load_model() configures.
+        if self.cpu_fast_mode and tta_mode != 'off':
+            self.log(f"   Fast Mode: forcing tta_mode='off' (was '{tta_mode}')")
             tta_mode = 'off'
 
         self.log("=" * 60)

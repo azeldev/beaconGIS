@@ -17,7 +17,11 @@ experimental=False
 deprecated=False
 hasProcessingProvider=False
 supportsQt6=True
-plugin_dependencies=onnxruntime,numpy,Pillow,scipy,opencv-python
+# plugin_dependencies is intentionally NOT set — that field is for other
+# QGIS plugin names, not pip packages. The plugin auto-installs its pip
+# dependencies on first run via change_detector._check_dependencies(),
+# preferring onnxruntime-directml on Windows for GPU acceleration without
+# requiring CUDA Toolkit.
 changelog=
     1.0.0 (2026-06-02):
       - Initial public release on the QGIS Plugin Repository.

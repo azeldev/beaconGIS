@@ -141,14 +141,12 @@ Default OFF (single forward pass per tile) so first-time users get a fast result
       <item row="1" column="0" colspan="3">
        <widget class="QCheckBox" name="cpu_fast_mode_checkbox">
         <property name="text">
-         <string>CPU Fast Mode — for machines without a GPU (~8× faster, slight accuracy hit)</string>
+         <string>Fast Mode — single model, no TTA (~2-8× faster, slight accuracy hit)</string>
         </property>
         <property name="toolTip">
-         <string>When enabled AND the engine detects no GPU is available, the plugin runs a stripped-down inference path: TTA is disabled (4× fewer forward passes) and only the primary cls model is loaded even when ensemble members are present in the plugin folder (2× fewer forward passes). Combined ~8× speedup on CPU at a measured accuracy cost of ~0.005 mean F1.
+         <string>When enabled, the plugin runs a stripped-down inference path regardless of active device: TTA is disabled (4× fewer forward passes) and only the primary cls model is loaded even when ensemble members are present in the plugin folder (2× fewer forward passes). Combined ~8× speedup on CPU, ~2× speedup on GPU, at a measured accuracy cost of ~0.005 mean F1.
 
-When a GPU is available, this checkbox has no effect — the full TTA + ensemble pipeline runs because GPU latency makes the accuracy gain free.
-
-Recommended ON for laptops without a GPU and field deployments where battery life matters. Recommended OFF for desktop installations with any CUDA / DirectML capable card.</string>
+Recommended ON for: laptops without a GPU, field deployments where battery life matters, or any time you prefer latency over the small accuracy boost from the ensemble. Recommended OFF for: published benchmark runs and final production output.</string>
         </property>
         <property name="checked">
          <bool>false</bool>
