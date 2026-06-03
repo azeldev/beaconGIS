@@ -26,6 +26,43 @@ RESTART_NEEDED = "restart"     # Deps installed; user must restart QGIS.
 DECLINED = "declined"          # User skipped, or install failed.
 
 
+def _find_python_executable():
+    """Locate the real Python interpreter — NOT sys.executable.
+
+    Inside QGIS on Windows, sys.executable points to qgis-bin.exe (the
+    QGIS launcher) because QGIS embeds Python. Running pip via that
+    executable would re-launch QGIS instead of invoking pip, which is
+    exactly the bug that opens new QGIS windows on every pip call.
+
+    The real interpreter is at sys.exec_prefix/python.exe on Windows or
+    sys.exec_prefix/bin/python on Unix. We probe a few likely locations
+    and return the first one that exists. Returns None if nothing is
+    found — caller should surface a clear error in that case."""
+    if sys.platform == 'win32':
+        candidates = [
+            os.path.join(sys.exec_prefix, 'python.exe'),
+            os.path.join(sys.base_exec_prefix, 'python.exe'),
+            os.path.join(sys.prefix, 'python.exe'),
+            os.path.join(os.path.dirname(sys.executable), 'python.exe'),
+        ]
+    else:
+        candidates = [
+            os.path.join(sys.exec_prefix, 'bin', 'python3'),
+            os.path.join(sys.exec_prefix, 'bin', 'python'),
+            os.path.join(sys.base_exec_prefix, 'bin', 'python3'),
+            os.path.join(sys.base_exec_prefix, 'bin', 'python'),
+        ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+# Windows: suppress the cmd console window pip would otherwise pop up.
+_SUBPROCESS_CREATE_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+
+
 def _required_dependencies():
     """Return [(import_name, pip_install_name, friendly_label), ...].
 
@@ -69,13 +106,18 @@ def _show_manual_instructions(iface, pip_cmd):
         "icons will appear automatically.")
 
 
-def _run_pip(missing_pip, extra_flags=None):
-    """Returns subprocess.CompletedProcess. Times out at 10 minutes."""
+def _run_pip(python_exe, missing_pip, extra_flags=None):
+    """Returns subprocess.CompletedProcess. Times out at 10 minutes.
+    Uses the discovered python_exe (NOT sys.executable, which is the
+    QGIS binary on Windows). CREATE_NO_WINDOW suppresses the cmd console
+    that would otherwise flash up on every pip invocation."""
     extra_flags = extra_flags or []
-    cmd = ([sys.executable, '-m', 'pip', 'install',
+    cmd = ([python_exe, '-m', 'pip', 'install',
             '--disable-pip-version-check']
            + extra_flags + missing_pip)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=600,
+        creationflags=_SUBPROCESS_CREATE_FLAGS)
 
 
 def ensure_dependencies(iface):
@@ -89,7 +131,24 @@ def ensure_dependencies(iface):
     from qgis.PyQt.QtWidgets import QMessageBox, QApplication
     from qgis.core import Qgis
 
-    pip_cmd = (f'"{sys.executable}" -m pip install '
+    # Find the actual Python interpreter (NOT sys.executable, which is
+    # qgis-bin.exe on Windows and would re-launch QGIS on every pip call).
+    python_exe = _find_python_executable()
+    if python_exe is None:
+        # Can't auto-install without finding the interpreter. Show manual
+        # instructions and bail out.
+        QMessageBox.critical(
+            iface.mainWindow(), "beaconGIS — could not locate Python",
+            "Could not find the Python interpreter inside your QGIS install. "
+            "Auto-install is unavailable.<br><br>"
+            "Open the <b>OSGeo4W Shell</b> from your Windows Start menu, then "
+            "paste:<br><br>"
+            f"<pre style='background:#eee;padding:6px;'>"
+            f"python -m pip install {' '.join(missing_pip)}</pre><br>"
+            "Restart QGIS after the install finishes.")
+        return DECLINED
+
+    pip_cmd = (f'"{python_exe}" -m pip install '
                + ' '.join(missing_pip))
 
     # First-run dialog. Three buttons: Install now / Show manual / Skip.
@@ -126,7 +185,7 @@ def ensure_dependencies(iface):
     QApplication.processEvents()
 
     try:
-        result = _run_pip(missing_pip)
+        result = _run_pip(python_exe, missing_pip)
         # Permission / externally-managed fallbacks → retry with --user
         if result.returncode != 0:
             err = (result.stderr or '').lower()
@@ -134,7 +193,7 @@ def ensure_dependencies(iface):
                     'permission denied', 'access is denied',
                     'errno 13', 'externally-managed-environment',
                     'no write permission')):
-                result = _run_pip(missing_pip, ['--user'])
+                result = _run_pip(python_exe, missing_pip, ['--user'])
 
         iface.messageBar().clearWidgets()
 
