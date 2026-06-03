@@ -469,6 +469,12 @@ class BuildingDamageEngine:
                     total = int(resp.headers.get("Content-Length", 0))
                     sha = hashlib.sha256()
                     bytes_read = 0
+                    # Log each 10% bucket exactly once. Without this guard
+                    # the inner `pct % 10 == 0` test matches for EVERY 64KB
+                    # chunk that arrives while pct rounds to e.g. 10.x,
+                    # which spams hundreds of log lines per tier and can
+                    # freeze the QGIS UI.
+                    last_logged_bucket = 0
                     with open(tmp, "wb") as out:
                         while True:
                             chunk = resp.read(1024 * 64)
@@ -478,9 +484,10 @@ class BuildingDamageEngine:
                             sha.update(chunk)
                             bytes_read += len(chunk)
                             if total:
-                                pct = 100 * bytes_read / total
-                                if int(pct) % 10 == 0 and int(pct) > 0:
-                                    self.log(f"    {int(pct)}% "
+                                bucket = int((100 * bytes_read / total) // 10) * 10
+                                if bucket > last_logged_bucket:
+                                    last_logged_bucket = bucket
+                                    self.log(f"    {bucket}% "
                                              f"({bytes_read // (1024*1024)} "
                                              f"of {total // (1024*1024)} MB)")
                 got_sha = sha.hexdigest()
