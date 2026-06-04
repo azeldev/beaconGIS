@@ -66,18 +66,34 @@ _SUBPROCESS_CREATE_FLAGS = (
 def _required_dependencies():
     """Return [(import_name, pip_install_name, friendly_label), ...].
 
+    Covers EVERY third-party pip package the plugin imports at runtime
+    (cross-checked against runtime imports in building_damage_engine,
+    change_detector, assistant, satellite_downloader, and the dialog).
+
+    `osgeo` (gdal/osr) is intentionally omitted — it ships bundled with
+    QGIS itself, so it's always importable.
+
     On Windows the default ONNX Runtime variant is the DirectML build so
     users get GPU acceleration on any DX12 card without installing CUDA
     Toolkit. Mac/Linux get plain onnxruntime."""
     is_win = sys.platform == 'win32'
     return [
+        # Core inference + numerics
         ('onnxruntime',
          'onnxruntime-directml' if is_win else 'onnxruntime',
          'ONNX Runtime' + (' (DirectML)' if is_win else '')),
-        ('numpy',  'numpy',         'NumPy'),
-        ('PIL',    'Pillow',        'Pillow'),
-        ('scipy',  'scipy',         'SciPy'),
-        ('cv2',    'opencv-python', 'OpenCV'),
+        ('numpy',   'numpy',         'NumPy'),
+        ('scipy',   'scipy',         'SciPy'),
+        ('PIL',     'Pillow',        'Pillow'),
+        ('cv2',     'opencv-python', 'OpenCV'),
+        # scikit-image for prob-aware watershed building splits.
+        # Falls back to connected components if absent, but ships with
+        # noticeably worse touching-building separation on urban scenes.
+        ('skimage', 'scikit-image',  'scikit-image'),
+        # psutil for the inference profiler's CPU memory delta reporting.
+        # Optional — engine logs a clear fallback message if absent — but
+        # the profile JSON is much more useful with it.
+        ('psutil',  'psutil',        'psutil'),
     ]
 
 
