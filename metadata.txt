@@ -7,9 +7,9 @@ version=1.0.0
 author=Adem Özel
 email=azel.dev03@gmail.com
 about=Classifies buildings into No Damage, Minor, Major, or Destroyed using a two-network deep-learning pipeline (LocalizationUNet + SiameseUNet, SeResNeXt-50 (32x4d) encoder, two-model ensemble) trained on the full public xView2/xBD dataset with Inria Aerial Image Labeling pretraining. xView2 official scorer Combined F1 = 0.7358. Designed for disaster-response teams: includes AOI clipping, CPU Fast Mode for non-GPU machines, automatic CRS-aware pre/post alignment, GSD normalization, offline template-driven SitRep generator (no LLM API), GeoPackage / GeoTIFF mask / JSON sidecar export. Runs entirely on ONNX Runtime (no PyTorch install required). Model weights (~234 MB fp16, CC BY-NC-SA 4.0) are downloaded on first use from the plugin's GitHub release page over plain HTTPS with SHA-256 verification — no account or token required. Outputs are draft assessments for human review — not authoritative ground truth.
-tracker=https://github.com/azeldev03/beaconGIS/issues
-repository=https://github.com/azeldev03/beaconGIS
-homepage=https://github.com/azeldev03/beaconGIS
+tracker=https://github.com/azeldev/beaconGIS/issues
+repository=https://github.com/azeldev/beaconGIS
+homepage=https://github.com/azeldev/beaconGIS
 tags=raster,vector,change detection,building damage,xview2,xbd,deep learning,disaster response,humanitarian,satellite imagery,onnx,siamese unet,remote sensing
 category=Raster
 icon=icon.png
