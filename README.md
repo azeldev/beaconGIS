@@ -50,7 +50,7 @@ On the OSGeo4W shell (Windows) replace `python` with `python-qgis` to install in
 ### Option B — Manual installation
 
 1. Download or clone this repository.
-2. Copy the `change_detector/` folder to your QGIS plugins directory:
+2. Copy the `beacongis/` folder to your QGIS plugins directory:
    - **Windows**: `C:\Users\<you>\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\`
    - **macOS**: `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
    - **Linux**: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
@@ -60,7 +60,7 @@ On the OSGeo4W shell (Windows) replace `python` with `python-qgis` to install in
 
 The plugin downloads ~234 MB of  model weights from the project's [GitHub releases page](https://github.com/azeldev03/beaconGIS/releases) on first run. No account, no token, no form — plain HTTPS download, SHA-256 verified end-to-end. Subsequent runs use the local cache.
 
-Manual install: download the three `.onnx` files from the [latest release](https://github.com/azeldev03/beaconGIS/releases/latest) and drop them into the plugin folder (e.g. `~/AppData/Roaming/QGIS/QGIS3/profiles/default/python/plugins/change_detector/`).
+Manual install: download the three `.onnx` files from the [latest release](https://github.com/azeldev03/beaconGIS/releases/latest) and drop them into the plugin folder (e.g. `~/AppData/Roaming/QGIS/QGIS3/profiles/default/python/plugins/beacongis/`).
 
 The model weights themselves are released under **CC BY-NC-SA 4.0** (academic / humanitarian use only; see [LICENSE](LICENSE)). The plugin code is GPL v2+ to match QGIS conventions.
 
