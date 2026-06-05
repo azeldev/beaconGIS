@@ -101,13 +101,17 @@ class ImageDownloadWorker(QThread):
                 url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{ty}/{tx}"
 
                 try:
+                    # Hardcoded https:// scheme above; assert the invariant
+                    # for static-analyzer benefit and defense-in-depth.
+                    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+                        continue
                     req = urllib.request.Request(url, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 QGIS-Plugin',
                         'Accept': 'image/png,image/*',
                         'Referer': 'https://www.arcgis.com/'
                     })
 
-                    with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as response:
+                    with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as response:  # nosec B310 - scheme validated above
                         content_type = response.headers.get('Content-Type', '')
                         tile_data = response.read()
 
@@ -204,10 +208,14 @@ class ImageDownloadWorker(QThread):
                 url = f"https://tile.openstreetmap.org/{self.zoom}/{tx}/{ty}.png"
 
                 try:
+                    # Hardcoded https:// scheme above; assert the invariant
+                    # for static-analyzer benefit and defense-in-depth.
+                    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+                        continue
                     req = urllib.request.Request(url, headers={
                         'User-Agent': 'QGIS-ChangeDetector-Plugin/1.0 (Educational)'
                     })
-                    with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as response:
+                    with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as response:  # nosec B310 - scheme validated above
                         tile_data = response.read()
                         tile_image = Image.open(io.BytesIO(tile_data))
                         if tile_image.mode != 'RGB':

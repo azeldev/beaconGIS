@@ -415,18 +415,22 @@ class BuildingDamageEngine:
     LOC_FILENAME = "loc_best_fp16.onnx"
     CLS_PRIMARY_FILENAME = "cls_best_fp16.onnx"
 
+    # SHA-256 integrity checksums for the downloaded ONNX weight files.
+    # These are PUBLIC integrity hashes (the opposite of secrets) — they are
+    # intentionally committed so the plugin can verify that downloaded weights
+    # match the published release and refuse to load tampered files.
     MODEL_FILES = {
         "loc_best_fp16.onnx": (
             f"{_RELEASE_BASE}/loc_best_fp16.onnx",
-            "cbe525b545bb35c511213d7805e33f2a40f12b2fb0cb1c461ec8b8820088518b",
+            "cbe525b545bb35c511213d7805e33f2a40f12b2fb0cb1c461ec8b8820088518b",  # pragma: allowlist secret
         ),
         "cls_best_fp16.onnx": (
             f"{_RELEASE_BASE}/cls_best_fp16.onnx",
-            "2e3e25b7b3c007e11f45037bf412d993f88017cf825a779807c0686b6bb2f724",
+            "2e3e25b7b3c007e11f45037bf412d993f88017cf825a779807c0686b6bb2f724",  # pragma: allowlist secret
         ),
         "cls_m2_fp16.onnx": (
             f"{_RELEASE_BASE}/cls_m2_fp16.onnx",
-            "9532d60121f68f6c8f439a8ad63c9c50d318e9e8c9ffb8e555fbc16ccc149125",
+            "9532d60121f68f6c8f439a8ad63c9c50d318e9e8c9ffb8e555fbc16ccc149125",  # pragma: allowlist secret
         ),
     }
 
@@ -443,6 +447,7 @@ class BuildingDamageEngine:
         import hashlib
         import urllib.request
         import urllib.error
+        import urllib.parse
         import ssl
 
         missing = [
@@ -463,9 +468,19 @@ class BuildingDamageEngine:
             path = os.path.join(plugin_dir, fname)
             self.log(f"  downloading {fname} from {url}...")
             tmp = path + ".part"
+            # Defense-in-depth: refuse anything but http(s). Model URLs are
+            # built from the hardcoded _RELEASE_BASE constant so this is
+            # already true by construction; the explicit guard makes the
+            # invariant obvious to static analyzers and to future maintainers.
+            parsed_scheme = urllib.parse.urlparse(url).scheme
+            if parsed_scheme not in ("http", "https"):
+                raise ValueError(
+                    f"Refusing to download weights from non-HTTP(S) URL "
+                    f"(scheme={parsed_scheme!r}): {url}"
+                )
             try:
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:
+                with urllib.request.urlopen(req, context=ctx, timeout=120) as resp:  # nosec B310 - scheme validated above
                     total = int(resp.headers.get("Content-Length", 0))
                     sha = hashlib.sha256()
                     bytes_read = 0
