@@ -1,7 +1,7 @@
 [general]
 name=beaconGIS — Building Damage Assessment
 qgisMinimumVersion=3.16
-qgisMaximumVersion=3.99
+qgisMaximumVersion=4.99
 description=AI building-level damage classification from pre/post-disaster RGB imagery, using a Siamese U-Net ensemble running on ONNX Runtime.
 version=1.0.0
 author=Adem Özel
@@ -16,7 +16,6 @@ icon=icon.png
 experimental=False
 deprecated=False
 hasProcessingProvider=False
-supportsQt6=True
 # plugin_dependencies is intentionally NOT set — that field is for other
 # QGIS plugin names, not pip packages. The plugin auto-installs its pip
 # dependencies on first run via change_detector._check_dependencies(),
