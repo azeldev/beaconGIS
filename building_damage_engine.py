@@ -30,6 +30,12 @@ _PROVIDER_LABELS = {
 }
 
 
+class DetectionCancelledError(RuntimeError):
+    """Raised from inside detect() when the host-supplied cancel callback
+    reports True (QgsTask / Processing feedback cancellation)."""
+    pass
+
+
 def _select_providers():
     """Pick the best provider chain available on this machine. Returns the
     full chain ordered by preference (each session falls back through it
@@ -309,7 +315,6 @@ class BuildingDamageEngine:
         self.providers = _select_providers()
         self.device = _DeviceShim(self.providers[0])
         self.model_loaded = False
-        self.img_size = 512
 
         # Loc gate: pixels above this loc-prob threshold are assigned a damage
         # class; below, background.
@@ -343,6 +348,34 @@ class BuildingDamageEngine:
         self.target_gsd_m = 0.5
         self.gsd_tolerance = 1.25    # only resample if >25% off target
         self.gsd_max_scale = 4.0
+
+        # Pre/post co-registration. Residual misregistration (geolocation
+        # error, off-nadir parallax) is a dominant failure mode on non-xBD
+        # pairs: the Siamese diff sees every rooftop edge shifted and reads
+        # it as damage. Global pass: phase correlation (large capture range)
+        # seeds an ECC translation refinement (subpixel) on a downsampled
+        # gray pair; the shift is applied to the post image once. Per-tile
+        # pass: bounded phase-correlation shift per tile, catching the
+        # spatially-varying parallax a single global shift cannot.
+        self.coregister = True
+        self.coreg_global_max_shift = 64.0   # px full-res; beyond = distrust
+        self.coreg_tile_refine = True
+        self.coreg_max_shift = 12.0          # px trust cap per tile
+        self.coreg_min_response = 0.05       # phase-corr response gate
+
+        # Confidence calibration: cls logits are divided by this temperature
+        # before softmax (Guo et al. 2017). T=1 = raw model; T>1 softens
+        # overconfident outputs. Loaded from calibration.json next to the
+        # weights when present (see calibrate_temperature.py). Per-pixel
+        # argmax is unchanged for a scalar T; only confidence values and
+        # the class-sum margins used by voting/upgrade rules shift.
+        self.cls_temperature = 1.0
+
+        # Host-UI hooks (QgsTask / Processing feedback). progress_callback
+        # receives a float 0..100; cancel_callback returns True to abort,
+        # which raises DetectionCancelledError out of detect().
+        self.progress_callback = None
+        self.cancel_callback = None
 
         # ImageNet normalization. float32 dtype is required — float64 would
         # upcast the input image to ~3 GB on a 100+ MP scene.
@@ -394,6 +427,21 @@ class BuildingDamageEngine:
     def log(self, message, level=Qgis.Info):
         QgsMessageLog.logMessage(message, 'Damage AI', level=level)
         print(f"[Damage AI] {message}")
+
+    def _report_progress(self, pct):
+        """Forward progress (0..100) to the host UI, if one is attached."""
+        cb = self.progress_callback
+        if cb is not None:
+            try:
+                cb(min(100.0, max(0.0, float(pct))))
+            except Exception:
+                pass
+
+    def _check_cancel(self):
+        """Abort the current detect() if the host requested cancellation."""
+        cb = self.cancel_callback
+        if cb is not None and cb():
+            raise DetectionCancelledError("Detection cancelled by user.")
     
     # Public weights distribution via GitHub Releases. Plain HTTPS GET, no
     # authentication required — anyone can download. After each weight
@@ -460,11 +508,11 @@ class BuildingDamageEngine:
 
         headers = {"User-Agent": "qgis-building-damage-plugin/1.0"}
         ctx = ssl.create_default_context()
-        total_mb = sum(int(s) if isinstance(s, int) else 0 for s in [0])
         self.log(f"First-run weights download: {len(missing)} file(s) from "
                  f"{self.WEIGHTS_HOMEPAGE}")
 
-        for fname, url, expected_sha in missing:
+        n_missing = len(missing)
+        for i_file, (fname, url, expected_sha) in enumerate(missing):
             path = os.path.join(plugin_dir, fname)
             self.log(f"  downloading {fname} from {url}...")
             tmp = path + ".part"
@@ -492,6 +540,7 @@ class BuildingDamageEngine:
                     last_logged_bucket = 0
                     with open(tmp, "wb") as out:
                         while True:
+                            self._check_cancel()
                             chunk = resp.read(1024 * 64)
                             if not chunk:
                                 break
@@ -499,6 +548,11 @@ class BuildingDamageEngine:
                             sha.update(chunk)
                             bytes_read += len(chunk)
                             if total:
+                                # Weights download occupies the 1..8% band
+                                # of the overall detect() progress bar.
+                                self._report_progress(
+                                    1.0 + 7.0 * (i_file + bytes_read / total)
+                                    / max(n_missing, 1))
                                 bucket = int((100 * bytes_read / total) // 10) * 10
                                 if bucket > last_logged_bucket:
                                     last_logged_bucket = bucket
@@ -545,6 +599,15 @@ class BuildingDamageEngine:
                     f"  HTTP {e.code}: {e.reason}\n\n"
                     f"To download manually, visit:\n  {self.WEIGHTS_HOMEPAGE}"
                 ) from e
+            except DetectionCancelledError:
+                # User cancellation, not a download failure — clean up the
+                # partial file and let the cancellation propagate untouched.
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                raise
             except Exception as e:
                 try:
                     if os.path.exists(tmp):
@@ -658,6 +721,26 @@ class BuildingDamageEngine:
                                 or self.cls_input_dtype == np.float16)
                      else 'fp32')
 
+        # Optional confidence-calibration sidecar (calibrate_temperature.py
+        # writes it after fitting on a held-out xBD split). Absent file =
+        # T=1.0 = raw model behavior.
+        calib_path = os.path.join(plugin_dir, 'calibration.json')
+        if os.path.exists(calib_path):
+            try:
+                with open(calib_path, 'r', encoding='utf-8') as f:
+                    calib = json.load(f)
+                t = float(calib.get('cls_temperature', 1.0))
+                if 0.1 <= t <= 10.0:
+                    self.cls_temperature = t
+                    self.log(f"  Confidence calibration: "
+                             f"cls_temperature={t:.3f} (calibration.json)")
+                else:
+                    self.log(f"  Ignoring out-of-range cls_temperature={t} "
+                             f"in calibration.json", Qgis.Warning)
+            except Exception as e:
+                self.log(f"  Could not read calibration.json: "
+                         f"{type(e).__name__}: {e}", Qgis.Warning)
+
         self.model_loaded = True
 
         n_cls = len(self.cls_models)
@@ -690,9 +773,8 @@ class BuildingDamageEngine:
 
         return True
 
-    def detect(self, before_layer, unused1, after_layer, unused2,
-               sensitivity=50, shape_type='square',
-               use_tta=False, tta_mode=None,
+    def detect(self, before_layer, after_layer,
+               sensitivity=50, use_tta=False, tta_mode=None,
                tile_size=512, overlap=64):
         """Detect damage and return building-shaped polygon features.
 
@@ -728,37 +810,65 @@ class BuildingDamageEngine:
         self.profiler.scalar('tta_mode', tta_mode)
         self.profiler.scalar('tile_size', tile_size)
         self.profiler.scalar('overlap', overlap)
+        self._report_progress(1)
 
         with self.profiler.stage('load_model'):
             self.load_model()
         self.profiler.scalar('cls_models', len(self.cls_models))
+        self._check_cancel()
+        self._report_progress(8)
 
         # Read inputs
         with self.profiler.stage('read_rgb_pre'):
             before_rgb = self.read_rgb(before_layer)
+        self._check_cancel()
+        self._report_progress(12)
         with self.profiler.stage('read_rgb_post'):
             after_rgb = self.read_rgb(after_layer)
         if before_rgb is None or after_rgb is None:
             raise Exception("Failed to read images")
+        self._check_cancel()
+        self._report_progress(15)
 
-        # Harmonize shapes — Siamese cls expects identical (H, W) for pre+post.
-        # Prefer geographic warp; fall back to pixel resize.
-        if after_rgb.shape[:2] != before_rgb.shape[:2]:
+        # Harmonize geometry — the Siamese cls compares pre/post per pixel,
+        # so the post image must sit on the pre image's exact grid. Equal
+        # array shapes do NOT imply alignment (same-zoom exports of shifted
+        # extents match shapes exactly), so compare CRS + extent + size and
+        # warp whenever they differ.
+        if not self._layers_georeferenced_alike(before_layer, after_layer):
             with self.profiler.stage('warp_post_to_pre'):
                 warped = self._warp_to_match(after_layer, before_layer)
                 if warped is not None:
                     after_rgb = warped
-                else:
+                    self.log("  post image warped onto the pre grid "
+                             "(CRS/extent/size differed)")
+                elif after_rgb.shape[:2] != before_rgb.shape[:2]:
                     import cv2
                     bh, bw = before_rgb.shape[:2]
                     after_rgb = cv2.resize(after_rgb, (bw, bh),
                                            interpolation=cv2.INTER_LINEAR)
-                    self.log("  pre/post shapes differ — no CRS, used pixel resize",
+                    self.log("  pre/post differ but could not be warped "
+                             "(no usable CRS) — used pixel resize. Verify "
+                             "the inputs actually cover the same area.",
+                             Qgis.Warning)
+                else:
+                    self.log("  pre/post geometry differs but no usable CRS "
+                             "to warp with — proceeding pixel-aligned. "
+                             "Verify the inputs cover the same area.",
                              Qgis.Warning)
 
         with self.profiler.stage('gsd_normalize'):
             before_rgb, after_rgb = self._normalize_gsd(
                 before_rgb, after_rgb, before_layer)
+        self._check_cancel()
+
+        # Remove the global pre/post shift before tiling. Runs after GSD
+        # normalization so the estimate is in model-resolution pixels.
+        if getattr(self, 'coregister', True):
+            with self.profiler.stage('coregister_global'):
+                after_rgb = self._coregister_global(before_rgb, after_rgb)
+        self._check_cancel()
+        self._report_progress(20)
 
         h, w = before_rgb.shape[:2]
         self.profiler.scalar('image_w', w)
@@ -783,6 +893,11 @@ class BuildingDamageEngine:
                 tile_size=tile_size,
                 overlap=overlap,
             )
+        # The uint8 scene buffers are no longer needed — free them before
+        # polygon extraction allocates its per-instance masks.
+        del before_rgb, after_rgb
+        self._check_cancel()
+        self._report_progress(92)
 
         # Cache per-pixel artifacts for downstream mask/JSON sidecar export.
         self._last_damage_mask = damage_mask
@@ -816,6 +931,7 @@ class BuildingDamageEngine:
                 damage_mask, confidence_map, ref_extent, px_w, px_h, sensitivity)
 
         self.profiler.scalar('n_polygons', len(features))
+        self._report_progress(100)
         self.profiler.end_run()
         self._last_profile = self.profiler.get_report()
         self.log(self.profiler.format_summary())
@@ -833,7 +949,12 @@ class BuildingDamageEngine:
                 use_tta=True, tta_mode=None,
                 tile_size=512, overlap=64):
         """Sliding-window Hanning-blended inference. Returns (damage_mask,
-        confidence_map). tta_mode in {'off', '4', '8'} (overrides use_tta)."""
+        confidence_map). tta_mode in {'off', '4', '8'} (overrides use_tta).
+
+        Inputs stay uint8 until the per-tile crop: normalizing the whole
+        scene up-front would allocate two extra float32 copies (~12 B/px
+        each on a 100+ MP scene), so ImageNet normalization happens on
+        each 512px tile instead."""
         if tta_mode is None:
             tta_mode = '4' if use_tta else 'off'
         tta_mode = str(tta_mode).lower()
@@ -842,17 +963,17 @@ class BuildingDamageEngine:
         h, w = before_rgb.shape[:2]
         num_classes = 5     # background + 4 damage classes
 
-        before_norm = self._normalize_image(before_rgb)
-        after_norm = self._normalize_image(after_rgb)
-
         # Single-shot fast path when the image fits in one tile.
         fits_in_one_tile = (h <= tile_size) and (w <= tile_size)
         asymmetric_small = (h < tile_size) or (w < tile_size)
         if fits_in_one_tile or asymmetric_small:
+            before_p = self._normalize_image(before_rgb)
+            after_p = self._normalize_image(after_rgb)
             pad_h = max(0, tile_size - h)
             pad_w = max(0, tile_size - w)
-            before_p = np.pad(before_norm, ((0, pad_h), (0, pad_w), (0, 0)))
-            after_p = np.pad(after_norm, ((0, pad_h), (0, pad_w), (0, 0)))
+            if pad_h or pad_w:
+                before_p = np.pad(before_p, ((0, pad_h), (0, pad_w), (0, 0)))
+                after_p = np.pad(after_p, ((0, pad_h), (0, pad_w), (0, 0)))
             with self.profiler.stage('predict_tile'):
                 prob = self._predict_tile_maybe_tta(before_p, after_p, tta_mode)
             tta_mult_sm = {'off': 1, '4': 4, '8': 8}.get(tta_mode, 4)
@@ -860,7 +981,8 @@ class BuildingDamageEngine:
             self.profiler.count('forward_passes',
                                 tta_mult_sm * max(1, len(self.cls_models)))
             prob = prob[:, :h, :w]
-            del before_norm, after_norm
+            del before_p, after_p
+            self._report_progress(90)
             with self.profiler.stage('finalize_prediction'):
                 damage_mask, confidence_map = self._finalize_prediction(prob)
             del prob
@@ -879,11 +1001,23 @@ class BuildingDamageEngine:
         forwards_per_tile = tta_mult * max(1, len(self.cls_models))
         log_every = max(1, n_tiles // 5)   # ~5 progress lines per scene
 
+        tile_refine = (getattr(self, 'coregister', True)
+                       and getattr(self, 'coreg_tile_refine', True))
+        self._coreg_tile_shifts = []
+
         for idx, (y0, x0) in enumerate(positions):
+            self._check_cancel()
             y1 = y0 + tile_size
             x1 = x0 + tile_size
-            before_tile = before_norm[y0:y1, x0:x1]
-            after_tile = after_norm[y0:y1, x0:x1]
+            before_tile_u8 = before_rgb[y0:y1, x0:x1]
+            after_tile_u8 = after_rgb[y0:y1, x0:x1]
+            if tile_refine:
+                with self.profiler.stage('coregister_tile'):
+                    after_tile_u8 = self._coregister_tile(
+                        before_tile_u8, after_tile_u8,
+                        after_rgb, y0, x0, tile_size)
+            before_tile = self._normalize_image(before_tile_u8)
+            after_tile = self._normalize_image(after_tile_u8)
             with self.profiler.stage('predict_tile'):
                 prob_tile = self._predict_tile_maybe_tta(
                     before_tile, after_tile, tta_mode)
@@ -893,17 +1027,25 @@ class BuildingDamageEngine:
             prob_accum[:, y0:y1, x0:x1] += prob_tile * weight[None, ...]
             weight_accum[y0:y1, x0:x1] += weight
 
+            # Tile loop occupies the 20..90% band of overall progress.
+            self._report_progress(20.0 + 70.0 * (idx + 1) / n_tiles)
             if (idx + 1) % log_every == 0 or idx + 1 == n_tiles:
                 self.log(f"  tiles {idx + 1}/{n_tiles}")
+
+        if tile_refine and self._coreg_tile_shifts:
+            shifts = np.asarray(self._coreg_tile_shifts)
+            self.log(f"   Per-tile co-registration: {len(shifts)}/{n_tiles} "
+                     f"tiles shifted (mean {shifts.mean():.1f} px, "
+                     f"max {shifts.max():.1f} px)")
+            self.profiler.scalar('coreg_tiles_shifted', int(len(shifts)))
 
         weight_accum = np.maximum(weight_accum, 1e-6)
         prob_accum /= weight_accum[None, ...]
 
-        # Tile loop is done — free the normalized RGB buffers + accumulators.
-        # On a 100+ MP scene these are several GB each; freeing them before
-        # _finalize_prediction leaves enough headroom for the voting path's
-        # per-building probability sums to allocate without OOM.
-        del before_norm, after_norm, weight_accum
+        # Tile loop is done — free the accumulator's companion buffer before
+        # _finalize_prediction so the voting path's per-building probability
+        # sums have headroom to allocate without OOM on 100+ MP scenes.
+        del weight_accum
 
         with self.profiler.stage('finalize_prediction'):
             damage_mask, confidence_map = self._finalize_prediction(prob_accum)
@@ -1177,6 +1319,147 @@ class BuildingDamageEngine:
         hann = np.hanning(tile_size + 2)[1:-1]  # drop the zeros at the ends
         return np.outer(hann, hann)
 
+    # ------------------------------------------------------------------
+    # Pre/post co-registration
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_gray_f32(rgb):
+        """uint8/float RGB -> float32 grayscale for correlation."""
+        import cv2
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    def _coreg_hann(self, shape):
+        """Cached Hanning window for phaseCorrelate (tiles share one size)."""
+        import cv2
+        cached = getattr(self, '_coreg_hann_cache', None)
+        if cached is None or cached[0] != shape:
+            win = cv2.createHanningWindow((shape[1], shape[0]), cv2.CV_32F)
+            self._coreg_hann_cache = (shape, win)
+            cached = self._coreg_hann_cache
+        return cached[1]
+
+    def _coregister_global(self, before_rgb, after_rgb):
+        """Estimate and remove the global translation of the post image
+        relative to the pre image. Phase correlation (large capture range)
+        seeds an ECC translation refinement (subpixel accuracy), both on a
+        downsampled grayscale pair; the resulting shift is applied to the
+        full-resolution post image once. Returns the aligned post image,
+        or the input unchanged when no shift is warranted / estimation
+        fails. Sign convention (verified): phaseCorrelate(pre, post)
+        returns post's displacement, so alignment translates post by the
+        negative shift."""
+        try:
+            import cv2
+        except ImportError:
+            return after_rgb
+        try:
+            h, w = before_rgb.shape[:2]
+            scale = max(1.0, max(h, w) / 1024.0)
+            pre_g = self._to_gray_f32(before_rgb)
+            post_g = self._to_gray_f32(after_rgb)
+            if scale > 1.0:
+                small = (int(round(w / scale)), int(round(h / scale)))
+                pre_g = cv2.resize(pre_g, small, interpolation=cv2.INTER_AREA)
+                post_g = cv2.resize(post_g, small, interpolation=cv2.INTER_AREA)
+
+            win = cv2.createHanningWindow(pre_g.shape[::-1], cv2.CV_32F)
+            (sx, sy), response = cv2.phaseCorrelate(pre_g, post_g, win)
+
+            # ECC refinement seeded with the phase-correlation estimate.
+            warp = np.array([[1, 0, sx], [0, 1, sy]], dtype=np.float32)
+            try:
+                criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                            50, 1e-4)
+                _, warp = cv2.findTransformECC(
+                    pre_g, post_g, warp, cv2.MOTION_TRANSLATION,
+                    criteria, None, 5)
+                sx, sy = float(warp[0, 2]), float(warp[1, 2])
+            except cv2.error:
+                pass    # keep the phase-correlation estimate
+            del pre_g, post_g
+
+            dx, dy = sx * scale, sy * scale    # back to full-res pixels
+            mag = float(np.hypot(dx, dy))
+            if mag < 0.5:
+                self.log(f"   Co-registration: global shift {mag:.2f} px — "
+                         f"already aligned")
+                return after_rgb
+            cap = float(getattr(self, 'coreg_global_max_shift', 64.0))
+            if mag > cap:
+                self.log(f"   Co-registration: estimated global shift "
+                         f"{mag:.1f} px exceeds the {cap:.0f} px trust cap — "
+                         f"not applied. The pair may be badly misregistered; "
+                         f"verify the inputs.", Qgis.Warning)
+                return after_rgb
+            M = np.float32([[1, 0, -dx], [0, 1, -dy]])
+            aligned = cv2.warpAffine(after_rgb, M, (w, h),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_REPLICATE)
+            self.log(f"   Co-registration: post image shifted by "
+                     f"({-dx:+.2f}, {-dy:+.2f}) px (phase-corr + ECC, "
+                     f"response {response:.2f})")
+            self.profiler.scalar('coreg_global_shift_px', round(mag, 2))
+            return aligned
+        except Exception as e:
+            self.log(f"   Global co-registration skipped: "
+                     f"{type(e).__name__}: {e}", Qgis.Warning)
+            return after_rgb
+
+    def _coregister_tile(self, before_tile, after_tile, after_full,
+                         y0, x0, tile_size):
+        """Bounded per-tile translation refinement via phase correlation —
+        catches the spatially-varying residual (parallax, jitter) left
+        after the global pass. The post tile is resampled from the shifted
+        position in the FULL post array so real neighbouring pixels slide
+        in instead of leaving blank borders. Returns the unshifted tile
+        when the correlation is weak, the shift is sub-half-pixel, or the
+        shift exceeds the trust cap."""
+        try:
+            import cv2
+            pre_g = self._to_gray_f32(before_tile)
+            post_g = self._to_gray_f32(after_tile)
+            if pre_g.std() < 1.0 or post_g.std() < 1.0:
+                return after_tile      # featureless tile, nothing to lock on
+            win = self._coreg_hann(pre_g.shape)
+            (dx, dy), response = cv2.phaseCorrelate(pre_g, post_g, win)
+            mag = float(np.hypot(dx, dy))
+            max_shift = float(getattr(self, 'coreg_max_shift', 12.0))
+            if (response < float(getattr(self, 'coreg_min_response', 0.05))
+                    or mag < 0.5 or mag > max_shift):
+                return after_tile
+
+            H, W = after_full.shape[:2]
+            m = int(np.ceil(max_shift)) + 2
+            wy0, wx0 = max(0, y0 - m), max(0, x0 - m)
+            wy1 = min(H, y0 + tile_size + m)
+            wx1 = min(W, x0 + tile_size + m)
+            window = after_full[wy0:wy1, wx0:wx1]
+            M = np.float32([[1, 0, -dx], [0, 1, -dy]])
+            shifted = cv2.warpAffine(window, M,
+                                     (window.shape[1], window.shape[0]),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_REPLICATE)
+            oy, ox = y0 - wy0, x0 - wx0
+            out = shifted[oy:oy + after_tile.shape[0],
+                          ox:ox + after_tile.shape[1]]
+            self._coreg_tile_shifts.append(mag)
+            return np.ascontiguousarray(out)
+        except Exception:
+            return after_tile
+
+    def _cls_softmax(self, logits, axis):
+        """Temperature-scaled softmax over cls logits. The temperature comes
+        from calibration.json (default 1.0 = raw model). Applied per ensemble
+        member, before the probability mean — matching how
+        calibrate_temperature.py fits T."""
+        logits = logits.astype(np.float32, copy=False)
+        t = float(getattr(self, 'cls_temperature', 1.0))
+        if t != 1.0:
+            logits = logits / t
+        return _np_softmax(logits, axis=axis)
+
     def _predict_tile_maybe_tta(self, before_tile, after_tile, tta_mode):
         """Run one tile with optional geometric TTA.
         Modes: 'off' (single pass), '4' (Klein four-group), '8' (full D4).
@@ -1292,15 +1575,13 @@ class BuildingDamageEngine:
         if len(self.cls_models) == 1:
             cls_logits = self.cls_models[0].run(
                 ['logits'], {'input': pair_batch})[0]   # (4, 4, ...)
-            cls_prob = _np_softmax(
-                cls_logits.astype(np.float32, copy=False), axis=1)
+            cls_prob = self._cls_softmax(cls_logits, axis=1)
             del cls_logits
         else:
             per_member = []
             for m in self.cls_models:
                 logits = m.run(['logits'], {'input': pair_batch})[0]
-                logits = logits.astype(np.float32, copy=False)
-                per_member.append(_np_softmax(logits, axis=1))
+                per_member.append(self._cls_softmax(logits, axis=1))
                 del logits
             cls_prob = np.mean(np.stack(per_member, axis=0), axis=0)
             del per_member
@@ -1381,14 +1662,12 @@ class BuildingDamageEngine:
 
         if len(self.cls_models) == 1:
             cls_logits = self.cls_models[0].run(['logits'], {'input': pair})[0]
-            cls_prob = _np_softmax(
-                cls_logits[0].astype(np.float32, copy=False), axis=0)
+            cls_prob = self._cls_softmax(cls_logits[0], axis=0)
         else:
             per_member = []
             for m in self.cls_models:
                 logits = m.run(['logits'], {'input': pair})[0]
-                per_member.append(_np_softmax(
-                    logits[0].astype(np.float32, copy=False), axis=0))
+                per_member.append(self._cls_softmax(logits[0], axis=0))
             cls_prob = np.mean(np.stack(per_member, axis=0), axis=0)
 
         bg = (1.0 - loc_prob)[None, ...]                   # (1, H_pad, W_pad)
@@ -1401,13 +1680,15 @@ class BuildingDamageEngine:
         return full
 
     def _normalize_image(self, rgb):
-        """Scale to [0,1] and apply ImageNet mean/std. Input may be uint8 or
-        float32 in [0,255]."""
-        img = rgb.astype(np.float32)
-        if img.max() > 1.0:
-            img = img / 255.0
-        img = (img - self.mean) / self.std
-        return img.astype(np.float32)
+        """Scale to [0,1] and apply ImageNet mean/std. Input may be uint8
+        (the engine's native scene format) or float in [0,255] / [0,1]."""
+        if rgb.dtype == np.uint8:
+            img = rgb.astype(np.float32) / 255.0
+        else:
+            img = rgb.astype(np.float32)
+            if img.max() > 1.0:
+                img = img / 255.0
+        return (img - self.mean) / self.std
     
     def extract_contour_polygons(self, mask, confidence_map, extent, px_w, px_h, sensitivity):
         """Extract building polygons with mean softmax confidence per region.
@@ -1649,42 +1930,56 @@ class BuildingDamageEngine:
         resized = pil.resize((target_shape[1], target_shape[0]), PILImage.NEAREST)
         return np.array(resized)
     
+    @staticmethod
+    def _stretch_to_u8(band):
+        """2–98 percentile contrast stretch of one band to uint8."""
+        band = band.astype(np.float32, copy=False)
+        if band.max() > band.min():
+            p2, p98 = np.percentile(band, (2, 98))
+            band = np.clip((band - p2) / (p98 - p2 + 1e-6) * 255, 0, 255)
+        else:
+            band = np.clip(band, 0, 255)
+        return band.astype(np.uint8)
+
     def read_rgb(self, layer):
+        """Read the layer source as (H, W, 3) uint8 with a per-channel 2–98
+        percentile stretch. uint8 keeps the full-scene footprint at 3 B/px
+        (the float work happens per tile in predict()); processing one band
+        at a time keeps the read-time peak to one float band + the uint8
+        output."""
         try:
             from osgeo import gdal
-            
+
             ds = gdal.Open(layer.source())
             if not ds:
                 return None
-            
+
             n_bands = ds.RasterCount
             h, w = ds.RasterYSize, ds.RasterXSize
-            
+
             self.log(f"   Reading {n_bands} bands, size {w}x{h}")
-            
+
+            rgb = np.zeros((h, w, 3), dtype=np.uint8)
             if n_bands >= 3:
-                rgb = np.zeros((h, w, 3), dtype=np.float32)
                 for i in range(3):
                     band = ds.GetRasterBand(i + 1).ReadAsArray()
-                    if band is not None:
-                        rgb[:, :, i] = band.astype(np.float32)
+                    if band is None:
+                        return None
+                    rgb[:, :, i] = self._stretch_to_u8(band)
+                    del band
             else:
                 band = ds.GetRasterBand(1).ReadAsArray()
                 if band is None:
                     return None
-                rgb = np.stack([band, band, band], axis=2).astype(np.float32)
-            
-            ds = None
+                gray = self._stretch_to_u8(band)
+                del band
+                rgb[:, :, 0] = gray
+                rgb[:, :, 1] = gray
+                rgb[:, :, 2] = gray
 
-            for i in range(3):
-                channel = rgb[:, :, i]
-                if channel.max() > channel.min():
-                    p2, p98 = np.percentile(channel, (2, 98))
-                    channel = np.clip((channel - p2) / (p98 - p2 + 1e-6) * 255, 0, 255)
-                    rgb[:, :, i] = channel
-            
+            ds = None
             return rgb
-            
+
         except Exception as e:
             self.log(f"ERROR: {e}", Qgis.Critical)
             return None
@@ -1717,9 +2012,15 @@ class BuildingDamageEngine:
                 if f and f > 0:
                     return (ext.width() / w) * f, (ext.height() / h) * f
 
-            # Geographic / unknown: measure on the ellipsoid.
+            # Geographic / unknown: measure on the ellipsoid. Use the
+            # transform context captured by the host (thread-safe) when
+            # available; QgsProject.instance() must not be touched from a
+            # QgsTask worker thread.
+            ctx = getattr(self, '_transform_context', None)
+            if ctx is None:
+                ctx = QgsProject.instance().transformContext()
             da = QgsDistanceArea()
-            da.setSourceCrs(crs, QgsProject.instance().transformContext())
+            da.setSourceCrs(crs, ctx)
             da.setEllipsoid('WGS84')
             cy = (ext.yMinimum() + ext.yMaximum()) / 2.0
             cx = (ext.xMinimum() + ext.xMaximum()) / 2.0
@@ -1788,6 +2089,34 @@ class BuildingDamageEngine:
                  f"(now ~{target:.2f} m/px)")
         return before_rs, after_rs
 
+    def _layers_georeferenced_alike(self, ref, src):
+        """True only when src already sits on ref's exact grid: same CRS,
+        same pixel dimensions, and extents matching within half a pixel.
+        Equal array shapes alone are NOT sufficient — two same-zoom exports
+        of shifted extents have identical shapes and zero alignment. When
+        neither layer has a usable CRS there is nothing geographic to
+        compare, so fall back to the shape check."""
+        try:
+            ref_crs, src_crs = ref.crs(), src.crs()
+            if not ref_crs.isValid() or not src_crs.isValid():
+                return (ref.width() == src.width()
+                        and ref.height() == src.height())
+            if ref_crs != src_crs:
+                return False
+            if ref.width() != src.width() or ref.height() != src.height():
+                return False
+            e1, e2 = ref.extent(), src.extent()
+            tol_x = 0.5 * e1.width() / max(ref.width(), 1)
+            tol_y = 0.5 * e1.height() / max(ref.height(), 1)
+            return (abs(e1.xMinimum() - e2.xMinimum()) <= tol_x
+                    and abs(e1.xMaximum() - e2.xMaximum()) <= tol_x
+                    and abs(e1.yMinimum() - e2.yMinimum()) <= tol_y
+                    and abs(e1.yMaximum() - e2.yMaximum()) <= tol_y)
+        except Exception as e:
+            self.log(f"   alignment check failed ({e}); assuming layers "
+                     f"are aligned", Qgis.Warning)
+            return True
+
     def _warp_to_match(self, src_layer, ref_layer):
         """Warp src_layer onto ref_layer's CRS/grid via GDAL. Returns
         (H, W, 3) float32 RGB, or None if CRS/extent unusable."""
@@ -1830,24 +2159,80 @@ class BuildingDamageEngine:
             if n_bands < 1:
                 return None
 
-            rgb = np.zeros((h, w, 3), dtype=np.float32)
+            # Same percentile stretch + uint8 format as read_rgb.
+            rgb = np.zeros((h, w, 3), dtype=np.uint8)
             for i in range(min(3, n_bands)):
                 band = warped.GetRasterBand(i + 1).ReadAsArray()
                 if band is not None:
-                    rgb[:, :, i] = band.astype(np.float32)
+                    rgb[:, :, i] = self._stretch_to_u8(band)
+                del band
             if n_bands == 1:
                 rgb[:, :, 1] = rgb[:, :, 0]
                 rgb[:, :, 2] = rgb[:, :, 0]
             warped = None
-
-            # Same percentile stretch as read_rgb (match normalization range).
-            for i in range(3):
-                ch = rgb[:, :, i]
-                if ch.max() > ch.min():
-                    p2, p98 = np.percentile(ch, (2, 98))
-                    rgb[:, :, i] = np.clip((ch - p2) / (p98 - p2 + 1e-6) * 255,
-                                           0, 255)
             return rgb
         except Exception as e:
             self.log(f"   warp_to_match failed: {e}", Qgis.Warning)
             return None
+
+    def save_damage_mask_geotiff(self, tif_path):
+        """Write the cached per-pixel damage mask from the last detect() as
+        a single-band uint8 GeoTIFF. Pixel values follow the xBD convention:
+        0=background, 1=NoDmg, 2=Minor, 3=Major, 4=Destroyed."""
+        try:
+            from osgeo import gdal, osr
+        except ImportError:
+            raise RuntimeError(
+                "GDAL is not available; cannot write GeoTIFF. "
+                "Install gdal in the QGIS Python env to use this option.")
+
+        mask = getattr(self, '_last_damage_mask', None)
+        extent = getattr(self, '_last_extent', None)
+        crs = getattr(self, '_last_crs', None)
+        if mask is None:
+            raise RuntimeError(
+                "Engine has no cached damage mask — did detection complete?")
+
+        mask = np.asarray(mask, dtype=np.uint8)
+        h, w = mask.shape[:2]
+
+        driver = gdal.GetDriverByName('GTiff')
+        # Single-band uint8, raw labels 0..4 (xBD / SpaceNet convention).
+        # LZW+PREDICTOR=2 + tiled 256x256 for compact, partial-read-friendly
+        # output.
+        ds = driver.Create(
+            tif_path, w, h, 1, gdal.GDT_Byte,
+            options=['COMPRESS=LZW', 'PREDICTOR=2',
+                     'TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256'])
+        if ds is None:
+            raise RuntimeError(f"GDAL could not create {tif_path}")
+
+        if extent is not None and w > 0 and h > 0:
+            # GDAL geotransform: top-left origin, y resolution negative.
+            x_min = extent.xMinimum()
+            y_max = extent.yMaximum()
+            px_w = extent.width() / float(w)
+            px_h = extent.height() / float(h)
+            ds.SetGeoTransform([x_min, px_w, 0.0, y_max, 0.0, -px_h])
+
+        if crs is not None and crs.isValid():
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(crs.toWkt())
+            ds.SetProjection(srs.ExportToWkt())
+
+        band = ds.GetRasterBand(1)
+        band.WriteArray(mask)
+        band.SetNoDataValue(0)
+
+        ds.SetMetadata({
+            'CLASS_0': 'background',
+            'CLASS_1': 'no_damage',
+            'CLASS_2': 'minor_damage',
+            'CLASS_3': 'major_damage',
+            'CLASS_4': 'destroyed',
+            'LABEL_FORMAT': 'xBD',
+        })
+        band.SetDescription(
+            'Damage class (0=bg, 1=NoDmg, 2=Minor, 3=Major, 4=Destroyed)')
+        ds.FlushCache()
+        ds = None
