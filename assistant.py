@@ -31,7 +31,9 @@ def classify_severity(stats):
     for label, max_d, max_a, idx in SEVERITY_TIERS:
         if dpct <= max_d and apct <= max_a:
             return label, idx
-    return SEVERITY_TIERS[-1][0], SEVERITY_TIERS[-1][2]
+    # Unreachable while the last tier caps at 100/100, but keep the
+    # fallback correct: (label, tier_index).
+    return SEVERITY_TIERS[-1][0], SEVERITY_TIERS[-1][3]
 
 
 class AssessmentReportsDock(QDockWidget):

@@ -3,30 +3,62 @@ name=beaconGIS — Building Damage Assessment
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
 description=AI building-level damage classification from pre/post-disaster RGB imagery, using a Siamese U-Net ensemble running on ONNX Runtime.
-version=1.0.0
+version=1.1.0
 author=Adem Özel
 email=azel.dev03@gmail.com
-about=Classifies buildings into No Damage, Minor, Major, or Destroyed using a two-network deep-learning pipeline (LocalizationUNet + SiameseUNet, SeResNeXt-50 (32x4d) encoder, two-model ensemble) trained on the full public xView2/xBD dataset with Inria Aerial Image Labeling pretraining. xView2 official scorer Combined F1 = 0.7358. Designed for disaster-response teams: includes AOI clipping, CPU Fast Mode for non-GPU machines, automatic CRS-aware pre/post alignment, GSD normalization, offline template-driven SitRep generator (no LLM API), GeoPackage / GeoTIFF mask / JSON sidecar export. Runs entirely on ONNX Runtime (no PyTorch install required). Model weights (~234 MB fp16, CC BY-NC-SA 4.0) are downloaded on first use from the plugin's GitHub release page over plain HTTPS with SHA-256 verification — no account or token required. Outputs are draft assessments for human review — not authoritative ground truth.
-tracker=https://github.com/azeldev/beaconGIS/issues
-repository=https://github.com/azeldev/beaconGIS
-homepage=https://github.com/azeldev/beaconGIS
+about=Classifies buildings into No Damage, Minor, Major, or Destroyed using a two-network deep-learning pipeline (LocalizationUNet + SiameseUNet, SeResNeXt-50 (32x4d) encoder, two-model ensemble) trained on the full public xView2/xBD dataset with Inria Aerial Image Labeling pretraining. xView2 official scorer Combined F1 = 0.7312. Designed for disaster-response teams: includes AOI clipping, CPU Fast Mode for non-GPU machines, automatic CRS-aware pre/post alignment, GSD normalization, offline template-driven SitRep generator (no LLM API), GeoPackage / GeoTIFF mask / JSON sidecar export. Runs entirely on ONNX Runtime (no PyTorch install required). Model weights (~234 MB fp16, CC BY-NC-SA 4.0) are downloaded on first use from the plugin's GitHub release page over plain HTTPS with SHA-256 verification — no account or token required. Outputs are draft assessments for human review — not authoritative ground truth.
+tracker=https://github.com/azeldev03/beaconGIS/issues
+repository=https://github.com/azeldev03/beaconGIS
+homepage=https://github.com/azeldev03/beaconGIS
 tags=raster,vector,change detection,building damage,xview2,xbd,deep learning,disaster response,humanitarian,satellite imagery,onnx,siamese unet,remote sensing
 category=Raster
 icon=icon.png
 experimental=False
 deprecated=False
-hasProcessingProvider=False
+hasProcessingProvider=yes
 # plugin_dependencies is intentionally NOT set — that field is for other
 # QGIS plugin names, not pip packages. The plugin auto-installs its pip
 # dependencies on first run via change_detector._check_dependencies(),
 # preferring onnxruntime-directml on Windows for GPU acceleration without
 # requiring CUDA Toolkit.
 changelog=
+    1.1.0 (2026-06-11):
+      - Detection now runs as a background QgsTask: QGIS stays responsive,
+        with live progress and Cancel in the task manager. The first-run
+        weights download is cancellable too.
+      - New Processing provider (beacongis:detectbuildingdamage): batch
+        mode, headless qgis_process runs, and Model Designer integration,
+        with polygon sink + optional damage-mask GeoTIFF outputs.
+      - Pre/post alignment is now verified geographically (CRS + extent +
+        size) instead of by array shape — same-size rasters covering
+        shifted extents are warped onto the pre grid instead of being
+        silently compared misaligned.
+      - Automatic pre/post co-registration: global phase-correlation + ECC
+        translation alignment, plus bounded per-tile phase-correlation
+        refinement, attacking the parallax/misregistration failure mode on
+        non-xBD pairs.
+      - Confidence calibration support: cls logits are temperature-scaled
+        before softmax when a calibration.json (fit on a held-out xBD
+        split via calibrate_temperature.py) ships next to the weights.
+      - Memory: scenes are held as uint8 and ImageNet normalization happens
+        per tile — several GB lower peak on 100+ MP scenes.
+      - Removed legacy dead parameters/code paths; misc fixes.
+    1.0.2 (2026-06-05):
+      - Plugin Repository security scan compliance: explicit URL scheme
+        allowlist (http/https only) before every urllib.request.urlopen call
+        in building_damage_engine and satellite_downloader, with matching
+        nosec B310 annotations; pragma: allowlist secret comments on the
+        three published SHA-256 model checksums (which are integrity hashes,
+        not credentials).
+    1.0.1 (2026-06-05):
+      - QGIS 4 / Qt6 readiness: bumped qgisMaximumVersion to 4.99, removed
+        deprecated supportsQt6 flag, replaced Qt5-only .exec_() calls with
+        the cross-version .exec() spelling.
     1.0.0 (2026-06-02):
       - Initial public release on the QGIS Plugin Repository.
       - Two-network architecture: LocalizationUNet + SiameseUNet ensemble (M1+M2).
       - SeResNeXt-50 (32x4d) encoder, ImageNet -> Inria Aerial -> xBD training.
-      - Combined F1 = 0.7358 (xView2 official scorer, full plugin pipeline).
+      - Combined F1 = 0.7312 (xView2 official scorer, full plugin pipeline).
       - Two-model softmax-averaged ensemble for more robust per-pixel predictions.
       - CPU Fast Mode for laptops without GPU (~8x speedup, ~0.5pt F1 cost).
       - GSD normalization to ~0.5 m/px training scale.
