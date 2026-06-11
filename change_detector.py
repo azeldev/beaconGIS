@@ -6,12 +6,90 @@ from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import (QgsProject, QgsVectorLayer, QgsFeature, QgsField, QgsFields,
                        QgsFillSymbol, QgsCategorizedSymbolRenderer, QgsRendererCategory,
                        QgsGeometry, QgsCoordinateTransform, QgsVectorFileWriter,
+                       QgsCoordinateReferenceSystem, QgsRectangle,
+                       QgsTask, QgsApplication,
                        QgsMessageLog, Qgis)
 from qgis.PyQt.QtCore import QVariant
 from .change_detector_dialog import ChangeDetectorDialog
-from .building_damage_engine import BuildingDamageEngine
+from .building_damage_engine import BuildingDamageEngine, DetectionCancelledError
 from .assistant import AssessmentReportsDock
 from .satellite_downloader import SatelliteDownloaderDock
+from .processing_provider import BeaconGISProcessingProvider
+
+
+class _LayerSnapshot:
+    """Thread-safe stand-in for a QgsRasterLayer, captured on the main
+    thread before the detection task starts. The engine only calls these
+    five accessors (pixel data is read directly via GDAL on the source
+    path), so the background task never touches a live QGIS layer object
+    from the worker thread."""
+
+    def __init__(self, layer):
+        self._source = layer.source()
+        self._crs = QgsCoordinateReferenceSystem(layer.crs())
+        self._extent = QgsRectangle(layer.extent())
+        self._width = layer.width()
+        self._height = layer.height()
+
+    def source(self):
+        return self._source
+
+    def crs(self):
+        return self._crs
+
+    def extent(self):
+        return QgsRectangle(self._extent)
+
+    def width(self):
+        return self._width
+
+    def height(self):
+        return self._height
+
+
+class DamageDetectionTask(QgsTask):
+    """Background damage detection. run() executes in QGIS's task thread
+    pool (first-run weights download + inference + polygonization), with
+    progress and cancellation wired into the engine; finished() hands the
+    results back to the plugin on the main thread."""
+
+    def __init__(self, description, engine, before_snap, after_snap,
+                 tta_mode, on_done):
+        super().__init__(description, QgsTask.CanCancel)
+        self.engine = engine
+        self.before_snap = before_snap
+        self.after_snap = after_snap
+        self.tta_mode = tta_mode
+        self.on_done = on_done
+        self.features = None
+        self.error = None
+        self.was_cancelled = False
+
+    def run(self):
+        try:
+            self.engine.progress_callback = self.setProgress
+            self.engine.cancel_callback = self.isCanceled
+            self.features = self.engine.detect(
+                self.before_snap, self.after_snap,
+                sensitivity=50,
+                tta_mode=self.tta_mode,
+            )
+            return True
+        except DetectionCancelledError:
+            self.was_cancelled = True
+            return False
+        except Exception as e:
+            import traceback
+            self.error = f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+            return False
+        finally:
+            self.engine.progress_callback = None
+            self.engine.cancel_callback = None
+
+    def finished(self, result):
+        # Runs on the main thread — safe to touch the GUI and QgsProject.
+        self.on_done(self, result)
 
 
 class ChangeDetector:
@@ -24,6 +102,8 @@ class ChangeDetector:
         self.assistant_dock = None
         self.satellite_dock = None
         self.actions = []
+        self.provider = None
+        self._active_task = None
         self.menu = '&Building Damage Assessment'
         self.toolbar = self.iface.addToolBar('BuildingDamage')
         self.toolbar.setObjectName('BuildingDamage')
@@ -48,7 +128,13 @@ class ChangeDetector:
         self.actions.append(action)
         return action
 
+    def initProcessing(self):
+        self.provider = BeaconGISProcessingProvider()
+        QgsApplication.processingRegistry().addProvider(self.provider)
+
     def initGui(self):
+        self.initProcessing()
+
         icon_path = os.path.join(self.plugin_dir, 'icon.png')
         self.add_action(icon_path, text='Detect Building Damage',
                         callback=self.run, parent=self.iface.mainWindow())
@@ -60,6 +146,18 @@ class ChangeDetector:
                         callback=self.show_satellite_downloader, parent=self.iface.mainWindow())
 
     def unload(self):
+        # A still-running background task must not outlive the plugin.
+        if self._active_task is not None:
+            try:
+                self._active_task.cancel()
+            except Exception:
+                pass
+            self._active_task = None
+
+        if self.provider is not None:
+            QgsApplication.processingRegistry().removeProvider(self.provider)
+            self.provider = None
+
         for action in self.actions:
             self.iface.removePluginRasterMenu(self.menu, action)
             self.iface.removeToolBarIcon(action)
@@ -104,121 +202,161 @@ class ChangeDetector:
                 self.satellite_dock.show()
 
     def run(self):
+        if self._active_task is not None:
+            self.iface.messageBar().pushMessage(
+                "Building Damage",
+                "A detection is already running — watch its progress in the "
+                "task manager (bottom status bar) or cancel it there first.",
+                level=Qgis.Warning, duration=6)
+            return
+
         if self.dialog is None:
             self.dialog = ChangeDetectorDialog(self.iface)
 
-        self.dialog.show()
-        result = self.dialog.exec_()
+        if self.dialog.exec():
+            self.start_damage_detection()
 
-        if result:
-            self.process_damage_detection()
+    def start_damage_detection(self):
+        """Validate inputs, snapshot everything the worker needs, and hand
+        detection to a background QgsTask. The UI stays responsive; results
+        come back via _on_detection_done on the main thread."""
+        before_layer = self.dialog.get_damage_before_layer()
+        after_layer = self.dialog.get_damage_after_layer()
 
-    def process_damage_detection(self):
-        # Dependency checking happens in __init__.py / _bootstrap before this
-        # plugin class even loads, so by the time we get here all required
-        # packages (onnxruntime, numpy, Pillow, scipy, opencv-python) are
-        # guaranteed to be importable. No need to recheck.
+        if not all([before_layer, after_layer]):
+            QMessageBox.warning(None, "Error",
+                "Please select both images:\n"
+                "- Before Disaster RGB Image\n"
+                "- After Disaster RGB Image")
+            return
+
+        # Cache the engine across runs (model load is 3-4 s). Cache is
+        # invalidated when CPU Fast Mode changes since that changes the
+        # loaded model set.
+        new_fast_mode = (self.dialog.get_cpu_fast_mode()
+                         if hasattr(self.dialog, 'get_cpu_fast_mode')
+                         else False)
+        cached = getattr(self, '_cached_engine', None)
+        cached_fast = getattr(self, '_cached_engine_fast_mode', None)
+        if cached is None or cached_fast != new_fast_mode:
+            engine = BuildingDamageEngine()
+            engine.cpu_fast_mode = new_fast_mode
+            self._cached_engine = engine
+            self._cached_engine_fast_mode = new_fast_mode
+        else:
+            engine = cached
+            # Profiler state must be fresh per detect; the engine's
+            # cached models stay loaded.
+            engine.profiler.reset()
+
+        # Captured on the main thread so the worker never has to touch
+        # QgsProject.instance().
+        engine._transform_context = QgsProject.instance().transformContext()
+
+        tta_mode = 'off'
+        if hasattr(self.dialog, 'get_tta_mode'):
+            tta_mode = self.dialog.get_tta_mode()
+        elif hasattr(self.dialog, 'get_use_tta'):
+            tta_mode = '4' if self.dialog.get_use_tta() else 'off'
+
+        if hasattr(self.dialog, 'get_segmentation_min_distance'):
+            seg_md = self.dialog.get_segmentation_min_distance()
+            if seg_md:
+                engine.watershed_min_distance = int(seg_md)
+
+        # Auto-timestamped output layer name so multiple runs in the same
+        # session don't collide on top of each other.
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+        layer_name = f"Building Damage {timestamp}"
+
+        aoi_layer = None
+        if hasattr(self.dialog, 'get_aoi_layer'):
+            aoi_layer = self.dialog.get_aoi_layer()
+
+        # Snapshot dialog state NOW — the user may reopen the dialog and
+        # change selections while the task runs.
+        run_ctx = {
+            'layer_name': layer_name,
+            'before_snap': _LayerSnapshot(before_layer),
+            'after_snap': _LayerSnapshot(after_layer),
+            'aoi_layer_id': aoi_layer.id() if aoi_layer is not None else None,
+            'want_gpkg': (self.dialog.get_save_gpkg()
+                          if hasattr(self.dialog, 'get_save_gpkg') else False),
+            'want_mask': (self.dialog.get_save_mask()
+                          if hasattr(self.dialog, 'get_save_mask') else False),
+        }
+
+        task = DamageDetectionTask(
+            f"beaconGIS — {layer_name}",
+            engine,
+            run_ctx['before_snap'],
+            run_ctx['after_snap'],
+            tta_mode,
+            on_done=lambda t, ok, ctx=run_ctx: self._on_detection_done(t, ok, ctx))
+
+        self._active_task = task
+        self.iface.messageBar().pushMessage(
+            "Building Damage",
+            "Detecting building damage in the background — QGIS stays "
+            "responsive. Progress and Cancel are in the task manager "
+            "(bottom status bar).",
+            level=Qgis.Info, duration=8)
+        QgsApplication.taskManager().addTask(task)
+
+    def _on_detection_done(self, task, ok, ctx):
+        """Main-thread completion handler: builds the layer, clips to AOI,
+        runs file exports, and feeds the Assessment Reports panel."""
+        self._active_task = None
+        engine = task.engine
+        layer_name = ctx['layer_name']
+
         try:
-            before_image = self.dialog.get_damage_before_layer()
-            after_image = self.dialog.get_damage_after_layer()
-
-            if not all([before_image, after_image]):
-                QMessageBox.warning(None, "Error",
-                    "Please select both images:\n"
-                    "- Before Disaster RGB Image\n"
-                    "- After Disaster RGB Image")
+            if task.was_cancelled:
+                self.iface.messageBar().pushMessage(
+                    "Building Damage", "Detection cancelled.",
+                    level=Qgis.Info, duration=5)
                 return
 
-            # Cache the engine across runs (model load is 3-4 s). Cache is
-            # invalidated when CPU Fast Mode changes since that changes the
-            # loaded model set.
-            new_fast_mode = (self.dialog.get_cpu_fast_mode()
-                             if hasattr(self.dialog, 'get_cpu_fast_mode')
-                             else False)
-            cached = getattr(self, '_cached_engine', None)
-            cached_fast = getattr(self, '_cached_engine_fast_mode', None)
-            if cached is None or cached_fast != new_fast_mode:
-                engine = BuildingDamageEngine()
-                engine.cpu_fast_mode = new_fast_mode
-                self._cached_engine = engine
-                self._cached_engine_fast_mode = new_fast_mode
-            else:
-                engine = cached
-                # Profiler state must be fresh per detect; the engine's
-                # cached models stay loaded.
-                engine.profiler.reset()
-
-            # Auto-timestamped output layer name so multiple runs in the same
-            # session don't collide on top of each other.
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-            layer_name = f"Building Damage {timestamp}"
-
-            self.iface.messageBar().pushMessage(
-                "Building Damage",
-                "Analyzing building damage with AI...",
-                level=0, duration=0)
-
-            try:
-                tta_mode = 'off'
-                if hasattr(self.dialog, 'get_tta_mode'):
-                    tta_mode = self.dialog.get_tta_mode()
-                elif hasattr(self.dialog, 'get_use_tta'):
-                    tta_mode = '4' if self.dialog.get_use_tta() else 'off'
-
-                if hasattr(self.dialog, 'get_segmentation_min_distance'):
-                    seg_md = self.dialog.get_segmentation_min_distance()
-                    if seg_md:
-                        engine.watershed_min_distance = int(seg_md)
-
-                change_features = engine.detect(
-                    before_image, None,
-                    after_image, None,
-                    sensitivity=50,
-                    shape_type='square',
-                    tta_mode=tta_mode,
-                )
-            except Exception as e:
-                self.iface.messageBar().clearWidgets()
+            if not ok or task.features is None:
                 QMessageBox.critical(
                     None, "Model Error",
                     f"Could not run AI building damage model.\n\n"
-                    f"Details:\n{str(e)}\n\n"
-                    f"Check the 'Damage AI' log panel (View → Panels → Log Messages) "
-                    f"for the full traceback."
-                )
-                import traceback
-                traceback.print_exc()
+                    f"Details:\n{task.error or 'unknown error'}\n\n"
+                    f"Check the 'Damage AI' log panel (View → Panels → "
+                    f"Log Messages) for the full traceback.")
                 return
 
+            change_features = task.features
             if not change_features:
-                self.iface.messageBar().clearWidgets()
                 QMessageBox.information(None, "Result",
-                    "No buildings detected in the post-disaster image.")
+                    "No buildings detected in the imagery.")
                 return
 
-            # AOI clip: drop polygons outside the user-supplied region.
-            aoi_layer = None
-            if hasattr(self.dialog, 'get_aoi_layer'):
-                aoi_layer = self.dialog.get_aoi_layer()
-            if aoi_layer is not None:
-                before_n = len(change_features)
-                change_features = self._clip_to_aoi(
-                    change_features, aoi_layer, before_image)
-                print(f"[Damage AI] AOI clip: {before_n} -> {len(change_features)} polygons")
-                if not change_features:
-                    self.iface.messageBar().clearWidgets()
-                    QMessageBox.information(None, "Result",
-                        "No buildings inside the AOI.")
-                    return
+            # AOI clip: drop polygons outside the user-supplied region. The
+            # AOI layer is resolved by id on the main thread — it may have
+            # been removed from the project while the task ran.
+            if ctx['aoi_layer_id']:
+                aoi_layer = QgsProject.instance().mapLayer(ctx['aoi_layer_id'])
+                if aoi_layer is not None:
+                    before_n = len(change_features)
+                    change_features = self._clip_to_aoi(
+                        change_features, aoi_layer, ctx['before_snap'])
+                    print(f"[Damage AI] AOI clip: {before_n} -> "
+                          f"{len(change_features)} polygons")
+                    if not change_features:
+                        QMessageBox.information(None, "Result",
+                            "No buildings inside the AOI.")
+                        return
 
             self.create_damage_layer(
-                change_features, before_image, layer_name)
+                change_features, ctx['before_snap'], layer_name)
 
             # Optional file exports (Output Options checkboxes).
             try:
                 self._save_outputs_if_requested(
-                    engine, change_features, before_image, after_image,
-                    layer_name)
+                    engine, change_features,
+                    ctx['before_snap'], ctx['after_snap'],
+                    layer_name, ctx['want_gpkg'], ctx['want_mask'])
             except Exception as e:
                 # Non-critical: notify but keep the detection result on screen.
                 print(f"[Damage AI] output export failed: "
@@ -227,7 +365,7 @@ class ChangeDetector:
                     "Output export",
                     f"Could not write all requested output files: "
                     f"{type(e).__name__}: {e}",
-                    level=1, duration=8)
+                    level=Qgis.Warning, duration=8)
 
             # Open the assistant panel and pass results (handles its own
             # stats + CSV export).
@@ -236,14 +374,12 @@ class ChangeDetector:
                 self.assistant_dock.set_assessment_data(
                     change_features, layer_name)
 
-            self.iface.messageBar().clearWidgets()
             self.iface.messageBar().pushMessage(
                 "Success",
                 f"Detected {len(change_features)} buildings!",
-                level=3, duration=5)
+                level=Qgis.Success, duration=5)
 
         except Exception as e:
-            self.iface.messageBar().clearWidgets()
             QMessageBox.critical(None, "Error", f"An error occurred:\n\n{str(e)}")
             import traceback
             traceback.print_exc()
@@ -363,22 +499,16 @@ class ChangeDetector:
         self._last_damage_layer = layer
 
     def _save_outputs_if_requested(self, engine, change_features,
-                                    before_layer, after_layer, layer_name):
+                                    before_layer, after_layer, layer_name,
+                                    want_gpkg, want_mask):
         """Dispatch GPKG / GeoTIFF / JSON sidecar exports per the dialog
-        checkboxes. Each is wrapped so one failure doesn't block the others.
+        checkboxes (snapshotted when the run started). Each is wrapped so
+        one failure doesn't block the others.
 
         Output names (when the post image is a real file):
             <post_basename>_damage.gpkg
             <post_basename>_mask.tif
             <post_basename>_meta.json"""
-        if not (hasattr(self.dialog, 'get_save_gpkg')
-                or hasattr(self.dialog, 'get_save_mask')):
-            return
-
-        want_gpkg = self.dialog.get_save_gpkg() if hasattr(
-            self.dialog, 'get_save_gpkg') else False
-        want_mask = self.dialog.get_save_mask() if hasattr(
-            self.dialog, 'get_save_mask') else False
         if not (want_gpkg or want_mask):
             return
 
@@ -387,7 +517,8 @@ class ChangeDetector:
             self.iface.messageBar().pushMessage(
                 "Output export",
                 "Could not determine an output directory from the post "
-                "image source; falling back to user home.", level=1, duration=6)
+                "image source; falling back to user home.",
+                level=Qgis.Warning, duration=6)
             out_dir = os.path.expanduser('~')
 
         base = self._derive_output_stem(after_layer, layer_name)
@@ -404,11 +535,11 @@ class ChangeDetector:
                 self.iface.messageBar().pushMessage(
                     "Output export",
                     f"GeoPackage export failed: {type(e).__name__}: {e}",
-                    level=2, duration=8)
+                    level=Qgis.Critical, duration=8)
         if want_mask:
             try:
                 tif_path = os.path.join(out_dir, f"{base}_mask.tif")
-                self._save_damage_mask_as_geotiff(engine, tif_path)
+                engine.save_damage_mask_geotiff(tif_path)
                 saved.append(os.path.basename(tif_path))
             except Exception as e:
                 print(f"[Damage AI] mask export failed: "
@@ -416,7 +547,7 @@ class ChangeDetector:
                 self.iface.messageBar().pushMessage(
                     "Output export",
                     f"Mask GeoTIFF export failed: {type(e).__name__}: {e}",
-                    level=2, duration=8)
+                    level=Qgis.Critical, duration=8)
         # Provenance + perf sidecars accompany whichever files were written.
         if want_gpkg or want_mask:
             try:
@@ -443,7 +574,7 @@ class ChangeDetector:
             self.iface.messageBar().pushMessage(
                 "Output export",
                 f"Saved {', '.join(saved)} to {out_dir}",
-                level=3, duration=8)
+                level=Qgis.Success, duration=8)
 
     def _derive_output_stem(self, after_layer, layer_name):
         """Filename stem for exports: prefer the post image's basename,
@@ -482,7 +613,8 @@ class ChangeDetector:
 
         meta = {
             'format': 'change-detector damage-mask v1',
-            'created_at_utc': _dt.datetime.utcnow().isoformat() + 'Z',
+            'created_at_utc': _dt.datetime.now(
+                _dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
             'layer_name': layer_name,
             'n_buildings_detected': int(n_features),
             'pre_image':  _src_of(before_layer),
@@ -525,6 +657,12 @@ class ChangeDetector:
                     getattr(engine, 'gsd_normalize', True)),
                 'target_gsd_m': float(
                     getattr(engine, 'target_gsd_m', 0.5)),
+                'coregister': bool(
+                    getattr(engine, 'coregister', True)),
+                'coreg_tile_refine': bool(
+                    getattr(engine, 'coreg_tile_refine', True)),
+                'cls_temperature': float(
+                    getattr(engine, 'cls_temperature', 1.0)),
             },
             'notes': (
                 "Pixel values in the *_mask.tif are integer class labels "
@@ -584,64 +722,3 @@ class ChangeDetector:
         if result and result[0] != QgsVectorFileWriter.NoError:
             raise RuntimeError(
                 f"GeoPackage write failed: {result[1] if len(result) > 1 else result[0]}")
-
-    def _save_damage_mask_as_geotiff(self, engine, tif_path):
-        """Write the engine's cached damage mask as a single-band uint8 GeoTIFF.
-        Pixel values follow the xBD convention:
-          0=background, 1=NoDmg, 2=Minor, 3=Major, 4=Destroyed."""
-        try:
-            from osgeo import gdal, osr
-        except ImportError:
-            raise RuntimeError(
-                "GDAL is not available; cannot write GeoTIFF. "
-                "Install gdal in the QGIS Python env to use this option.")
-
-        mask = getattr(engine, '_last_damage_mask', None)
-        extent = getattr(engine, '_last_extent', None)
-        crs = getattr(engine, '_last_crs', None)
-        if mask is None:
-            raise RuntimeError(
-                "Engine has no cached damage mask — did detection complete?")
-
-        import numpy as _np
-        mask = _np.asarray(mask, dtype=_np.uint8)
-        h, w = mask.shape[:2]
-
-        driver = gdal.GetDriverByName('GTiff')
-        # Single-band uint8, raw labels 0..4 (xBD / SpaceNet convention).
-        # LZW+PREDICTOR=2 + tiled 256x256 for compact, partial-read-friendly output.
-        ds = driver.Create(
-            tif_path, w, h, 1, gdal.GDT_Byte,
-            options=['COMPRESS=LZW', 'PREDICTOR=2',
-                     'TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256'])
-        if ds is None:
-            raise RuntimeError(f"GDAL could not create {tif_path}")
-
-        if extent is not None and w > 0 and h > 0:
-            # GDAL geotransform: top-left origin, y resolution negative.
-            x_min = extent.xMinimum()
-            y_max = extent.yMaximum()
-            px_w = extent.width() / float(w)
-            px_h = extent.height() / float(h)
-            ds.SetGeoTransform([x_min, px_w, 0.0, y_max, 0.0, -px_h])
-
-        if crs is not None and crs.isValid():
-            srs = osr.SpatialReference()
-            srs.ImportFromWkt(crs.toWkt())
-            ds.SetProjection(srs.ExportToWkt())
-
-        band = ds.GetRasterBand(1)
-        band.WriteArray(mask)
-        band.SetNoDataValue(0)
-
-        ds.SetMetadata({
-            'CLASS_0': 'background',
-            'CLASS_1': 'no_damage',
-            'CLASS_2': 'minor_damage',
-            'CLASS_3': 'major_damage',
-            'CLASS_4': 'destroyed',
-            'LABEL_FORMAT': 'xBD',
-        })
-        band.SetDescription('Damage class (0=bg, 1=NoDmg, 2=Minor, 3=Major, 4=Destroyed)')
-        ds.FlushCache()
-        ds = None
